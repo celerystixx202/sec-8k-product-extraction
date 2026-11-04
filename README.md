@@ -75,4 +75,4 @@ python extract.py cache/<accession>.txt  # run the LLM on one cached filing
 - `new_products.csv` – structured output (cleaned)
 - `new_products_raw.csv` – raw LLM output before cleanup
 - `run_log.csv` – per-filing processing log
-- `report.md` – methodology report
+- `report.md` – methodology report (`report.docx` is the same report as a Word document)
