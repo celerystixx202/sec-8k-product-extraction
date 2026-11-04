@@ -1,115 +1,98 @@
-# Extracting New Product Announcements from SEC 8-K Filings with a Local LLM
+# Pulling New Product Launches Out of SEC 8-K Filings with a Local LLM
 
-**Author:** Brendan Fuller
-**GitHub:** https://github.com/celerystixx202/sec-8k-product-extraction
+**Brendan Fuller**
+**Code:** https://github.com/celerystixx202/sec-8k-product-extraction
 
-## 1. Objective
+## What I was trying to do
 
-Form 8-K is the "current report" public companies file with the SEC when a
-material event occurs. A fraction of these announce new products. The goal of
-this project was to build a Python pipeline that downloads 8-K filings for
-S&P 500 companies, uses a large language model to identify new product
-announcements, and writes the results to a CSV with five columns:
-`company_name, stock_name, filing_time, new_product, product_description`.
+Every public company has to file an 8-K with the SEC when something material
+happens: earnings, a new CEO, a big contract, or a product launch. Buried in
+those filings is a steady stream of "we just launched X" announcements, but
+nobody reads hundreds of 8-Ks by hand. The goal here was to build a Python
+pipeline that pulls 8-Ks for S&P 500 companies, hands each one to a language
+model running on my laptop, and gets back a clean table: company, ticker,
+filing date, product name, and a one-line description under 180 characters.
 
-## 2. Data Source
+## Where the data came from
 
-Two SEC endpoints were used, parsed with `requests` and BeautifulSoup:
+I used two SEC endpoints, both free and both parsed with `requests` and
+BeautifulSoup:
 
-- `https://www.sec.gov/files/company_tickers.json` maps a ticker symbol to
-  the company's Central Index Key (CIK), e.g. AAPL to 0000320193.
-- `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=8-K&count={n}&output=atom`
-  returns an Atom feed of the company's most recent 8-K filings, each with a
-  filing date, accession number, and a link to the filing's index page.
+- `company_tickers.json` turns a ticker into the company's CIK number, which is
+  how the SEC identifies filers. Apple's ticker AAPL maps to CIK 0000320193.
+- The EDGAR browse feed, queried with that CIK and `type=8-K`, returns the
+  company's most recent 8-Ks as an Atom feed with the filing date and a link
+  to each filing's index page.
 
-From the index page the script downloads the primary 8-K document **and every
-EX-99 exhibit**. This turned out to be essential: the 8-K cover document is
-usually a one-page form that only says "see attached press release", while the
-actual product description lives in Exhibit 99.1.
+From the index page the code grabs the main 8-K document and, importantly,
+every EX-99 exhibit attached to it. More on why that matters below.
 
-The S&P 500 ticker list (503 symbols) was taken from the Wikipedia
-constituents table. Tickers with a period (BRK.B) were rewritten with a hyphen
-(BRK-B) to match the SEC's convention.
+The S&P 500 list itself, 503 tickers, came from the Wikipedia constituents
+table. Tickers with a dot like BRK.B were swapped to BRK-B because that is how
+the SEC writes them.
 
-## 3. Methodology
+## How the pipeline works
 
-### 3.1 Preprocessing
+**Step 1: clean the text.** Each filing is HTML. I strip the tags, drop
+scripts and styles, and remove the hidden inline XBRL block at the top. That
+block is machine-readable accounting metadata, and without removing it the
+first thousand characters of every filing were tag soup. Cleaned text is
+cached on disk so reruns are instant.
 
-Each downloaded HTML document is converted to plain text with BeautifulSoup.
-Scripts, styles, and the hidden inline-XBRL header block (`<ix:header>`) are
-removed, since the latter injects hundreds of accounting tags at the top of
-the text that would waste the model's context window. Whitespace is collapsed.
-Cleaned text is cached on disk by accession number so the pipeline can be
-rerun without re-downloading.
+**Step 2: filter before paying the LLM cost.** Most 8-Ks have nothing to do
+with products. They are earnings releases, debt deals, or board changes. A
+quick regular expression looks for launch language: *launch*, *introduce*,
+*unveil*, *now available*, *new product*, and so on. Only filings that match
+go to the model. In the final run this filter threw out 81 percent of
+filings, which is what made the whole thing fast enough to be practical.
 
-### 3.2 Keyword pre-filter
+**Step 3: let the model do the extraction.** The model is Llama 3.1 8B,
+running locally through Ollama on an Apple M4 MacBook with 24 GB of RAM. No
+paid API, no usage fees. The prompt tells the model to act as a Named Entity
+Recognition system and tag two kinds of entities: the ORGANIZATION filing the
+report, and any PRODUCT the company says it is launching or releasing. It
+returns JSON in a fixed shape so Python can parse it every time.
 
-Most 8-Ks report earnings, debt offerings, or executive changes. Sending all
-of them to the LLM would waste most of the run time. A regular expression
-checks for product-launch language (*launch*, *introduce*, *unveil*, *now
-available*, *new product*, *general availability*, etc.). Only filings that
-match are sent to the model. In the final run, 81% of filings were
-dropped by this filter.
+Three settings made the difference between junk and usable output:
 
-### 3.3 LLM extraction with a Named Entity Recognition prompt
+- Ollama's JSON mode, which forces the model to return valid JSON.
+- Temperature zero, so the same filing always gives the same answer.
+- A context window of 8,192 tokens. Ollama defaults to 2,048, which silently
+  chops off most of each filing. The model only sees the tail and misses
+  everything in the press release. Fixing this was the single biggest
+  accuracy win in the project.
 
-The LLM is **Llama 3.1 8B** (`llama3.1:8b`, 4.9 GB, Q4 quantization), served
-locally by Ollama on an Apple M4 MacBook with 24 GB of RAM. No paid API was
-used.
+The prompt also tells the model what not to tag: earnings, dividends,
+acquisitions, executive changes, or existing products that just get mentioned.
+If there is no launch, it returns an empty list. Descriptions get trimmed to
+180 characters at a word boundary as a final backstop.
 
-The prompt instructs the model to act as a Named Entity Recognition system
-tagging two entity types, **ORGANIZATION** (the filing company) and
-**PRODUCT** (a newly announced product), and to return strict JSON:
+**Step 4: write it out.** The main script walks the ticker list, pulls the ten
+most recent 8-Ks per company, runs the filter and the model, and appends one
+CSV row per product. A second log file records every filing it touched. The
+script can be stopped and restarted without redoing work.
 
-```json
-{"company_name": "...", "products": [{"new_product": "...", "product_description": "..."}]}
-```
+**Step 5: clean up.** An 8B model is good but not perfect. A short
+post-processing script removes two kinds of noise: generic names that are not
+real products, like "new transmission assets," and the same product showing up
+twice because a quarterly earnings release re-listed a launch from the prior
+quarter. The raw model output is kept alongside the cleaned file so both can
+be inspected.
 
-Three settings matter for reliability:
-
-- `format: "json"` makes Ollama constrain the output to valid JSON, so Python
-  can parse it with `json.loads` every time.
-- `temperature: 0` makes the extraction deterministic.
-- `num_ctx: 8192` raises Ollama's context window from its default of 2,048
-  tokens. Without this the model silently sees only the tail of each filing.
-  Up to 20,000 characters of filing text are passed.
-
-The prompt explicitly tells the model not to tag earnings, dividends,
-acquisitions, executive changes, or existing products merely mentioned, and
-to return an empty list when there is no launch. Descriptions are trimmed to
-180 characters at a word boundary as a final safeguard.
-
-### 3.4 Pipeline and output
-
-`main.py` iterates through the ticker list, pulls the 10 most recent 8-Ks per
-company, applies the filter, calls the model, and appends one CSV row per
-product found. A second file, `run_log.csv`, records every filing examined
-with its size, filter result, and LLM latency. The run is resumable.
-
-### 3.5 Post-processing
-
-`postprocess.py` applies two cleanup rules to the raw model output and keeps
-the raw file alongside the cleaned one. First, generic names that are not
-specific products ("new transmission assets", "Duralast branded products")
-are dropped with a short regular-expression blocklist (13 rows). Second, the
-same product reported by the same company in more than one filing, which
-happens when a quarterly earnings release re-lists a launch from the previous
-quarter, is kept only once at its earliest filing date (56 rows).
-
-## 4. Results
+## What came out
 
 | Metric | Value |
 |---|---|
-| Companies examined (S&P 500, alphabetical from MMM to BAX) | 58 |
+| Companies examined (S&P 500, alphabetical, MMM through BAX) | 58 |
 | 8-K filings downloaded and parsed | 568 |
-| Filings passing keyword filter (sent to LLM) | 110 |
-| Filings where the LLM found at least one product | 90 |
+| Filings that passed the keyword filter and went to the LLM | 110 |
+| Filings where the model found at least one product | 90 |
 | Companies with at least one product | 29 |
-| Raw product rows from the LLM (`new_products_raw.csv`) | 360 |
-| Rows after dedupe and cleanup (`new_products.csv`) | 291 |
-| Filing dates covered | 2025-05-01 to 2026-10-29 |
-| Mean LLM time per filing | 51.2 s |
-| Total run time (download + LLM) | 102.6 min |
+| Raw product rows from the model | 360 |
+| Rows after cleanup, in `new_products.csv` | 291 |
+| Filing dates covered | May 2025 to Oct 2026 |
+| Average model time per filing | 51 seconds |
+| Total run time | 103 minutes |
 
 Companies examined: MMM, AOS, ABT, ABBV, ACN, ADBE, AMD, AES, AFL, A, APD,
 ABNB, AKAM, ALB, ARE, ALGN, ALLE, LNT, ALL, GOOGL, MO, AMZN, AMCR, AEE, AEP,
@@ -117,62 +100,58 @@ AXP, AIG, AMT, AWK, AMP, AME, AMGN, APH, ADI, AON, APA, APO, AAPL, AMAT, APP,
 APTV, ACGL, ADM, ARES, ANET, AJG, AIZ, T, ATO, ADSK, ADP, AZO, AVY, AXON, BKR,
 BALL, BAC, BAX.
 
-The companies with the most products were Baker Hughes (BKR), Amazon (AMZN),
-Amgen (AMGN), AMD, and Airbnb (ABNB), all of which attach long press releases
-listing product launches to their quarterly 8-Ks. Banks, utilities, and
-insurers (BAC, AEP, AIG) produced few or none, as expected.
+The heavy hitters were Baker Hughes, Amazon, Amgen, AMD, and Airbnb. They all
+attach long press releases to their quarterly 8-Ks with a "highlights" section
+that reads like a product catalog. Banks, utilities, and insurers like Bank of
+America, AEP, and AIG produced almost nothing, which is what you would expect.
 
-Sample output:
+A few rows from the output:
 
 ```
-company_name | stock_name | filing_time | new_product | product_description
-Apple Inc. | AAPL | 2025-07-31 | Apple Vision Pro | a new software design that extends across all of our platforms…
-Apple Inc. | AAPL | 2025-10-30 | iPhone 17 Pro | Apple's high-end smartphone…
-Advanced Micro Devices, Inc. | AMD | 2026-02-03 | AMD FSR 'Redstone' | machine-learning based features delivering more immersive visuals for …
-Advanced Micro Devices, Inc. | AMD | 2026-02-03 | AMD Ryzen 7 9850X3D | fastest gaming processor, powered by the 'Zen 5' architecture and AMD …
-AMAZON.COM, INC. | AMZN | 2026-04-14 | Amazon Leo | Amazon's low Earth orbit satellite network, delivering fast, reliable …
-AMAZON.COM, INC. | AMZN | 2026-04-14 | Amazon Leo Direct-to-Device (D2D) system | allows Amazon to deliver more advanced voice, data, and messaging serv…
-Arista Networks, Inc. | ANET | 2025-05-06 | Cluster Load Balancing (CLB) | maximizes AI workload performance with consistent, low-latency network…
-Arista Networks, Inc. | ANET | 2025-05-06 | Arista CloudVision Universal Network Observability (CV UNO) | offers AI job-centric observability for enhanced troubleshooting and r…
-Axon Enterprise, Inc. | AXON | 2026-02-24 | Axon 911 | AI-enabled 911 call handling with modernized communications, precise l…
-Axon Enterprise, Inc. | AXON | 2026-02-24 | Axon Vehicle Intelligence | AI-powered automatic license plate recognition (ALPR) solution with re…
+Apple Inc. | AAPL | 2025-10-30 | iPhone 17 Pro | Apple's high-end smartphone
+AMD | AMD | 2026-08-04 | AMD Ryzen Embedded X100 Series | New embedded x86 processors for robotics and industrial automation
+Axon | AXON | 2026-02-24 | Axon Vehicle Intelligence | AI-powered license plate recognition with a real-time operations platform
+Amazon | AMZN | 2026-04-29 | Amazon Bio Discovery | An agentic AI application designed to accelerate drug discovery
+Airbnb | ABNB | 2025-11-06 | Reserve Now, Pay Later | Lets guests pay $0 upfront when booking eligible domestic stays
 ```
 
-## 5. Challenges
+## What went wrong along the way
 
-**The product is not in the 8-K itself.** The first version only downloaded
-the primary document and found almost nothing, because the announcement is in
-the attached press release. Fetching EX-99 exhibits fixed this.
+**The product was never in the 8-K itself.** My first version only
+downloaded the main 8-K document and found almost nothing. The 8-K cover is
+usually a one-page form that says "see attached press release." The actual
+announcement is in Exhibit 99.1. Once I started pulling the exhibits too, the
+results went from empty to useful.
 
-**Inline XBRL noise.** Modern filings embed machine-readable tags in a hidden
-header. Before stripping it, the first thousand characters of every filing
-were accounting codes.
+**Hidden XBRL noise.** Modern filings embed accounting tags in a hidden
+header. Before I stripped it, the model was wasting its context window on
+things like `us-gaap:CommonStockMember`.
 
-**Ollama's default context window.** The default of 2,048 tokens truncates
-filings silently. Raising `num_ctx` was the single biggest accuracy
-improvement, at the cost of roughly doubling latency.
+**The default context window is a trap.** Ollama's 2,048-token default
+truncates silently. Nothing errors, the model just reads the last page and
+guesses. Raising it to 8,192 roughly doubled the time per filing but fixed
+the accuracy.
 
-**Over-extraction from earnings releases.** Earnings press releases often
-contain a paragraph of "business highlights" listing products launched during
-the quarter. The model correctly extracts those, but it sometimes also tags a
-long-standing product mentioned in passing (e.g. an existing energy-storage
-product). The prompt's negative instructions reduced but did not eliminate
-this; a second validation pass with the model would be a natural next step.
+**Earnings releases over-deliver.** A quarterly release often lists every
+product launched that quarter, which is great, but the model sometimes also
+tags a long-standing product that just gets mentioned in passing. Telling the
+model what not to extract helped. A second validation pass with the model
+would be the obvious next step.
 
-**SEC rate limits.** EDGAR requires a User-Agent header identifying the
-requester and occasionally returns HTTP 503 under load. A 150 ms delay
-between requests and retry with exponential backoff handled this.
+**The SEC rate-limits you.** EDGAR requires a User-Agent header with your
+name and email and occasionally throws a 503 under load. A short delay between
+requests and retry with backoff handled it.
 
-**Speed.** At ~30-45 seconds per filing for an 8B model reading up to 5,000
-tokens, 100 filings takes about an hour. The keyword filter is what makes
-scaling to the full S&P 500 feasible.
+**It is slow.** An 8B model reading up to 5,000 tokens takes 30 to 50
+seconds per filing. A hundred filings is well over an hour. The keyword
+filter is the only reason scaling to the full S&P 500 is realistic.
 
-## 6. Repository
+## Where everything is
 
-Code, CSV output, and this report are at
 https://github.com/celerystixx202/sec-8k-product-extraction
 
-- `main.py`, `sec_fetch.py`, `extract.py` – pipeline
-- `new_products.csv` – structured output
-- `run_log.csv` – per-filing processing log
-- `README.md` – setup and run instructions
+- `main.py`, `sec_fetch.py`, `extract.py`, `postprocess.py` – the pipeline
+- `new_products.csv` – the cleaned output, 291 rows
+- `new_products_raw.csv` – the model's raw output before cleanup
+- `run_log.csv` – every filing examined, with timing
+- `README.md` – how to install and run it
